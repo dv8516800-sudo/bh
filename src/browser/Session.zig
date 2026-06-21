@@ -1,0 +1,794 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+const builtin = @import("builtin");
+
+const App = @import("../App.zig");
+
+const js = @import("js/js.zig");
+const storage = @import("webapi/storage/storage.zig");
+const Navigation = @import("webapi/navigation/Navigation.zig");
+const History = @import("webapi/History.zig");
+
+const Frame = @import("Frame.zig");
+const Page = @import("Page.zig");
+pub const Runner = @import("Runner.zig");
+const Browser = @import("Browser.zig");
+const Notification = @import("../Notification.zig");
+const QueuedNavigation = Frame.QueuedNavigation;
+
+const log = lp.log;
+const ArenaPool = App.ArenaPool;
+const Allocator = std.mem.Allocator;
+const IS_DEBUG = builtin.mode == .Debug;
+
+// A Session represents a browsing context group (cookie jar, session storage,
+// navigation history) within a Browser. It hosts one Page at a time — the
+// root Frame and all of its descendants — and is responsible for Page
+// lifecycle (create, remove, replace on root navigation).
+//
+// Multiple concurrent Pages (e.g. an old Page retiring while a new provisional
+// Page is loading) are not yet supported; see Page.zig for the intended
+// direction.
+const Session = @This();
+
+browser: *Browser,
+arena: Allocator,
+history: History,
+navigation: Navigation,
+storage_shed: storage.Shed,
+// Backs `globalThis.lp.*`; values pre-stringified so the prelude splices
+// them in without re-encoding.
+bridge_store: std.StringHashMapUnmanaged([]const u8) = .empty,
+notification: *Notification,
+cookie_jar: storage.Cookie.Jar,
+/// User-provided scripts to inject into header.
+inject_scripts: []const []const u8 = &.{},
+
+// Shared allocator. Used by Session itself and borrowed by Pages.
+arena_pool: *ArenaPool,
+
+// The currently-active Page
+// flips this pointer.
+_active: ?*Page = null,
+
+// In-flight root navigation
+_pending: ?*Page = null,
+
+_page_destruction_queue: std.ArrayList(*Page) = .{},
+
+// Loader IDs are scoped to the Session: each new BrowserContext gets a
+// fresh counter. Frame IDs (`frame_id_gen`) live on `Browser` instead so
+// CDP target IDs stay unique across BrowserContext lifecycle on a single
+// connection (see `Browser.frame_id_gen` and issue #2472).
+loader_id_gen: u32 = 0,
+
+// configuration (or CDP command) to disable iframe loading
+subframe_loading_enabled: bool = true,
+
+// configuration (or CDP command) to disable Web Worker loading. When false,
+// `new Worker(url)` returns a Worker object whose script is never fetched
+// and never evaluated. Set from the `--disable-workers` CLI flag at
+// session init; the LP.configureLoading CDP method can flip it per-session.
+worker_loading_enabled: bool = true,
+
+// Console.* capture for the `consoleLogs` tool, capped at `max_console_bytes`.
+// Opt-in via `enableConsoleCapture`: plain CDP `serve` never drains it, so
+// leaving the listener off keeps the buffer at zero bytes.
+_console_messages: std.Io.Writer.Allocating,
+_console_capture: bool = false,
+
+// Opt-in fetch of external <link rel=stylesheet> resources. Defaults to
+// false to preserve the current rendering-free fast path: drivers that
+// don't need accurate visibility checks pay nothing. Set from the
+// `--enable-external-stylesheets` CLI flag at session init; the
+// LP.configureLoading CDP method can flip it per-session. When true,
+// `Link.linkAddedCallback` routes to `Frame.loadExternalStylesheet`
+// (synchronous fetch + parse + register on `document.styleSheets`).
+load_external_stylesheets: bool = false,
+
+/// Caller-supplied cancellation probe. `Runner._wait` polls it between
+/// ticks; once `check` returns true the wait returns `error.Cancelled`.
+/// The agent installs this so SIGINT can abort an in-flight tool call
+/// (goto, search, waitForSelector, …) without sitting through the full
+/// timeout.
+cancel_hook: ?CancelHook = null,
+
+// Download handling configured via the `Browser.setDownloadBehavior` CDP
+// method (see issue #2701). When `download_behavior` is `.allow` or
+// `.allow_and_name`, a navigation whose response carries
+// `Content-Disposition: attachment` is written to `download_path` instead
+// of being parsed as a page, and (when `download_events_enabled` is set)
+// `Browser.downloadWillBegin` / `Browser.downloadProgress` events are emitted.
+// `download_path` is duped into the Session arena.
+download_behavior: DownloadBehavior = .deny,
+download_path: ?[]const u8 = null,
+download_events_enabled: bool = false,
+
+pub const DownloadBehavior = enum {
+    allow,
+    allow_and_name,
+    // The CDP `default` behavior is mapped to `deny`: we don't write downloads
+    // to disk unless the driver explicitly opts in with `allow`/`allowAndName`.
+    deny,
+};
+
+pub const CancelHook = struct {
+    context: *anyopaque,
+    check: *const fn (*anyopaque) bool,
+};
+
+pub fn isCancelled(self: *const Session) bool {
+    const hook = self.cancel_hook orelse return false;
+    return hook.check(hook.context);
+}
+
+const max_console_bytes = 64 * 1024;
+
+pub fn init(self: *Session, browser: *Browser, notification: *Notification) !void {
+    const allocator = browser.app.allocator;
+    const arena_pool = browser.arena_pool;
+
+    const arena = try arena_pool.acquire(.small, "Session");
+    errdefer arena_pool.release(arena);
+
+    self.* = .{
+        .arena = arena,
+        .arena_pool = arena_pool,
+        .history = .{},
+        // The prototype (EventTarget) for Navigation is created when a Frame is created.
+        .navigation = .{ ._proto = undefined },
+        .storage_shed = .{},
+        .browser = browser,
+        .notification = notification,
+        .cookie_jar = storage.Cookie.Jar.init(allocator, notification),
+        // CLI defaults; LP.configureLoading can flip these per-session.
+        .subframe_loading_enabled = !browser.app.config.disableSubframes(),
+        .worker_loading_enabled = !browser.app.config.disableWorkers(),
+        ._console_messages = .init(allocator),
+        .load_external_stylesheets = browser.app.config.enableExternalStylesheets(),
+    };
+    errdefer self._console_messages.deinit();
+}
+
+/// Register the console listener so `drainConsoleMessages` returns output. Idempotent.
+pub fn enableConsoleCapture(self: *Session) !void {
+    if (self._console_capture) return;
+    try self.notification.register(.console_message, self, onConsoleMessage);
+    self._console_capture = true;
+}
+
+pub fn deinit(self: *Session) void {
+    if (self._console_capture) {
+        self.notification.unregister(.console_message, self);
+    }
+
+    if (self._pending != null) {
+        self.discardPendingPage();
+    }
+    if (self._active != null) {
+        self.removePage();
+    }
+    self.processDestroyQueues();
+
+    self.cookie_jar.deinit();
+
+    self.browser.env.memoryPressureNotification(.critical);
+
+    self.storage_shed.deinit(self.browser.app.allocator);
+    {
+        const allocator = self.browser.app.allocator;
+        var it = self.bridge_store.iterator();
+        while (it.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        self.bridge_store.deinit(allocator);
+    }
+    self._console_messages.deinit();
+    self.arena_pool.release(self.arena);
+}
+
+fn onConsoleMessage(ctx: *anyopaque, msg: *const Notification.ConsoleMessage) !void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    const aw = &self._console_messages;
+    const start = aw.written().len;
+    if (start >= max_console_bytes) return;
+
+    // Format into a scratch buffer sized to the remaining budget so a single
+    // 10 MB `console.log` can't bust the cap before the post-hoc check fires.
+    const remaining = max_console_bytes - start;
+    var scratch_buf: [max_console_bytes]u8 = undefined;
+    var scratch: std.Io.Writer = .fixed(scratch_buf[0..remaining]);
+    appendConsoleMessageInner(&scratch, msg) catch {};
+    aw.writer.writeAll(scratch.buffered()) catch {
+        aw.shrinkRetainingCapacity(start);
+    };
+}
+
+fn appendConsoleMessageInner(w: *std.Io.Writer, msg: *const Notification.ConsoleMessage) !void {
+    try w.print("[{s}] ", .{@tagName(msg.type)});
+    for (msg.values, 0..) |value, i| {
+        if (i > 0) try w.writeAll(" ");
+        try value.format(w);
+    }
+    try w.writeByte('\n');
+}
+
+/// Drains and clears the buffered console output. The returned slice is valid
+/// until the next dispatched `console_message` reuses the backing storage,
+/// so callers must consume or copy it before that happens.
+pub fn drainConsoleMessages(self: *Session) []const u8 {
+    const text = self._console_messages.written();
+    self._console_messages.clearRetainingCapacity();
+    return text;
+}
+
+pub fn processDestroyQueues(self: *Session) void {
+    {
+        const queue = self._page_destruction_queue.items;
+        if (queue.len > 0) {
+            for (queue) |page| {
+                page.deinit();
+                self.browser.page_pool.destroy(page);
+            }
+            self._page_destruction_queue.clearRetainingCapacity();
+        }
+    }
+}
+
+// True iff there is an active Page. CDP / external callers should use this
+// (or `currentPage()`) rather than poking at the underlying field.
+pub fn hasPage(self: *const Session) bool {
+    return self._active != null;
+}
+
+// Allocate and initialize a Page.
+fn allocatePage(self: *Session, frame_id: u32) !*Page {
+    const page = try self.browser.page_pool.create();
+    errdefer self.browser.page_pool.destroy(page);
+
+    try Page.init(page, self, frame_id);
+    return page;
+}
+
+// Tear down and free a Page allocated via allocatePage.
+fn queuePageDestruction(self: *Session, page: *Page) void {
+    self._page_destruction_queue.append(self.arena, page) catch @panic("OOM");
+}
+
+// Tear down the currently-active Page. Dispatches `frame_remove` first
+// so CDP can clear inspector state while the OLD page is still walkable,
+// then frees the slot and notifies Navigation. Used by removePage and
+// by the synthetic-nav path (replaceRootImmediate). Does NOT touch any
+// pending page — callers handle that themselves.
+//
+// Frame IDs are NOT reset here — the counter lives on `Browser` and is
+// monotonic for the lifetime of the CDP connection so target IDs stay
+// unique (issue #2472). The previous reset-to-zero behaviour was
+// invisible within a single Session/BrowserContext (the next
+// `installNewActivePage` was usually called with the old frame's
+// explicit `frame_id`, see `replaceRootImmediate`) but caused
+// `Duplicate target FID-...` collisions when a new BrowserContext
+// allocated its first page after dispose.
+//
+// NOT a substitute for the careful 5-step sequence in commitPendingPage,
+// which interleaves the OLD-page teardown with the pending-page promotion
+// in a specific order.
+fn tearDownActivePage(self: *Session) void {
+    self.notification.dispatch(.frame_remove, .{});
+    const page = self._active orelse {
+        if (comptime IS_DEBUG) {
+            lp.assert(false, "Session.tearDownActivePage - no active page", .{});
+        }
+        return;
+    };
+
+    page.frame.abortTransfers();
+    self.queuePageDestruction(page);
+    self._active = null;
+    self.navigation.onRemoveFrame();
+}
+
+// Allocate a Page in a free slot, publish it as the active page, and
+// dispatch `frame_created` so CDP creates fresh isolated-world V8
+// contexts. Used by createPage and by the synthetic-nav path. Does NOT
+// dispatch `frame_navigate` — the caller does that (or doesn't, for a
+// blank initial page).
+//
+// On any failure after allocation, the errdefers roll back the Page
+// and `active`, leaving the session pageless (the caller is responsible
+// for any prior teardown of an old page).
+fn installNewActivePage(self: *Session, frame_id: u32) !*Frame {
+    const page = try self.allocatePage(frame_id);
+    errdefer self.queuePageDestruction(page);
+    self._active = page;
+    errdefer self._active = null;
+
+    const frame = &page.frame;
+    try self.navigation.onNewFrame(frame);
+    // Inform CDP the main frame has been created such that additional
+    // context for other Worlds can be created as well.
+    self.notification.dispatch(.frame_created, frame);
+    return frame;
+}
+
+// NOTE: the caller is not the owner of the returned value,
+// the pointer on Frame is just returned as a convenience
+pub fn createPage(self: *Session) !*Frame {
+    lp.assert(self._active == null, "Session.createPage - page not null", .{});
+
+    // Drain any pending Page deinits now, while we're at a known-safe point
+    self.processDestroyQueues();
+
+    if (comptime IS_DEBUG) {
+        log.debug(.browser, "create page", .{});
+    }
+    return self.installNewActivePage(self.nextFrameId());
+}
+
+pub fn removePage(self: *Session) void {
+    if (self._active == null) {
+        lp.assert(false, "Session.removePage - page is null", .{});
+    }
+
+    // If a navigation is in flight, drop the pending Page first. Its
+    // transfer was protected from abort to survive commitPendingPage's
+    // teardown of the old page, but we are now permanently removing the
+    // session's page state — the pending transfer should die with it.
+    if (self._pending != null) {
+        self.discardPendingPage();
+    }
+    self.tearDownActivePage();
+    if (comptime IS_DEBUG) {
+        log.debug(.browser, "remove page", .{});
+    }
+}
+
+pub fn getArena(self: *Session, size_or_bucket: anytype, debug: []const u8) !Allocator {
+    return self.arena_pool.acquire(size_or_bucket, debug);
+}
+
+pub fn releaseArena(self: *Session, allocator: Allocator) void {
+    self.arena_pool.release(allocator);
+}
+
+pub fn getOrCreateOrigin(self: *Session, key_: ?[]const u8) !*js.Origin {
+    return self.currentPage().?.getOrCreateOrigin(key_);
+}
+
+pub fn releaseOrigin(self: *Session, origin: *js.Origin) void {
+    self.currentPage().?.releaseOrigin(origin);
+}
+
+pub fn currentPage(self: *Session) ?*Page {
+    return self._active;
+}
+
+pub fn pendingPage(self: *Session) ?*Page {
+    return self._pending;
+}
+
+pub fn pendingOrCurrentFrame(self: *Session) ?*Frame {
+    const page = self.pendingPage() orelse self.currentPage() orelse return null;
+    return &page.frame;
+}
+
+pub fn currentFrame(self: *Session) ?*Frame {
+    const page = self.currentPage() orelse return null;
+    return &page.frame;
+}
+
+pub fn findFrameByFrameId(self: *Session, frame_id: u32) ?*Frame {
+    const page = self.currentPage() orelse return null;
+    return page.findFrameByFrameId(frame_id);
+}
+
+pub fn runner(self: *Session, opts: Runner.Opts) !Runner {
+    return Runner.init(self, opts);
+}
+
+/// Page transfers run on the session thread's curl multi; left unserviced
+/// while the frontend waits on input they die on curl's wall-clock timeout.
+/// Returns how long the caller may block before pumping again.
+pub fn idleSlice(self: *Session) u31 {
+    const quiet_ms = 250;
+    self.processDestroyQueues();
+    var r = self.runner(.{}) catch return quiet_ms;
+    const result = r.tick(.{ .ms = 25 }) catch return quiet_ms;
+    return switch (result) {
+        .done => quiet_ms,
+        .ok => |next_ms| @intCast(@min(next_ms, quiet_ms)),
+    };
+}
+
+pub fn scheduleNavigation(self: *Session, frame: *Frame) !void {
+    return self.currentPage().?.scheduleNavigation(frame);
+}
+
+pub fn processQueuedNavigation(self: *Session) !void {
+    const page = self.currentPage() orelse return;
+    const navigations = page.queued_navigation;
+    if (page.queued_navigation == &page.queued_navigation_1) {
+        page.queued_navigation = &page.queued_navigation_2;
+    } else {
+        page.queued_navigation = &page.queued_navigation_1;
+    }
+
+    if (page.frame._queued_navigation != null) {
+        // This is both an optimization and a simplification of sorts. If the
+        // root frame is navigating, then we don't need to process any other
+        // navigation. Also, the navigation for the root frame and for a frame
+        // is different enough that have two distinct code blocks is, imo,
+        // better. Yes, there will be duplication.
+        navigations.clearRetainingCapacity();
+        return self.processRootQueuedNavigation();
+    }
+
+    const about_blank_queue = &page.queued_queued_navigation;
+    defer about_blank_queue.clearRetainingCapacity();
+
+    // First pass: process async navigations (non-about:blank)
+    for (navigations.items) |frame| {
+        const qn = frame._queued_navigation orelse {
+            // Was previously an assert; downgraded so prod can recover, but
+            // kept at warn so the invariant violation isn't silently lost.
+            log.warn(.frame, "skipped null queued nav", .{});
+            continue;
+        };
+
+        if (qn.is_about_blank) {
+            // Defer about:blank to second pass
+            try about_blank_queue.append(self.arena, frame);
+            continue;
+        }
+
+        // qn is invalid after this
+        self.processFrameNavigation(frame, qn) catch {
+            // already logged
+        };
+    }
+
+    navigations.clearRetainingCapacity();
+
+    // Second pass: process synchronous navigations (about:blank)
+    // These may trigger new navigations which go into queued_navigation.
+    // Mirror the first pass: a failure on one frame must not orphan the
+    // rest of the queue (the `defer clearRetainingCapacity` would wipe
+    // siblings whose _queued_navigation stays set).
+    for (about_blank_queue.items) |frame| {
+        const qn = frame._queued_navigation orelse {
+            // Was previously an assert; downgraded so prod can recover, but
+            // kept at warn so the invariant violation isn't silently lost.
+            log.warn(.frame, "skipped null queued nav", .{});
+            continue;
+        };
+        self.processFrameNavigation(frame, qn) catch |err| {
+            log.warn(.frame, "frame navigation", .{ .url = qn.url, .err = err });
+        };
+    }
+
+    // Safety: Remove any about:blank navigations that were queued during
+    // processing to prevent infinite loops. New navigations have been queued
+    // in the other buffer.
+    const new_navigations = page.queued_navigation;
+    var i: usize = 0;
+    while (i < new_navigations.items.len) {
+        const frame = new_navigations.items[i];
+        if (frame._queued_navigation) |qn| {
+            if (qn.is_about_blank) {
+                log.warn(.frame, "recursive about blank", .{});
+                _ = page.queued_navigation.swapRemove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) !void {
+    frame._queued_navigation = null;
+    defer self.releaseArena(qn.arena);
+
+    // A popup whose window was close()'d is parked in page.closed_frames and
+    // torn down at Page.deinit. It must never be navigated. This navigation
+    // can happen _after_ window.close() has been called (because JS can do
+    // anything with that window), so the safest place to prevent navigation
+    // from happening is here.
+    if (frame.window._closed) {
+        return;
+    }
+
+    self._processFrameNavigation(frame, qn) catch |err| {
+        log.warn(.frame, "frame navigation", .{ .url = qn.url, .err = err });
+        return err;
+    };
+}
+
+fn _processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) !void {
+    // Popups live on the Page as top-level browsing contexts without a
+    // parent or iframe element. Their re-navigation path is simpler than
+    // iframes — no parent bookkeeping to patch.
+    if (frame.parent == null and frame.iframe == null) {
+        return self.processPopupNavigation(frame, qn);
+    }
+
+    lp.assert(frame.parent != null, "root queued navigation", .{});
+
+    const iframe = frame.iframe.?;
+    const parent = frame.parent.?;
+
+    errdefer iframe._window = null;
+
+    const parent_notified = frame._parent_notified;
+    if (parent_notified) {
+        // we already notified the parent that we had loaded
+        parent._pending_loads += 1;
+    }
+
+    const frame_id = frame._frame_id;
+    const reuse_window = frame.window;
+    const page = self.currentPage().?;
+    frame.deinit();
+    frame.* = undefined;
+
+    errdefer {
+        // If anything fails from this point on, frame.deinit will be called
+        // and we need to remove the frame from the parent's frame list.
+        for (parent.child_frames.items, 0..) |f, i| {
+            if (f == frame) {
+                parent.child_frames_sorted = false;
+                _ = parent.child_frames.swapRemove(i);
+                break;
+            }
+        }
+    }
+
+    try Frame.init(frame, frame_id, page, .{ .parent = parent, .reuse_window = reuse_window });
+    errdefer {
+        if (parent_notified) {
+            parent._pending_loads -= 1;
+        }
+        frame.deinit();
+    }
+
+    frame.iframe = iframe;
+    iframe._window = frame.window;
+
+    frame.navigate(qn.url, qn.opts) catch |err| {
+        log.err(.browser, "queued frame navigation error", .{ .err = err });
+        return err;
+    };
+}
+
+// Re-navigates a popup Frame in place. Both the Frame pointer and its Window
+// stay stable across the re-init, so a cached `window.open()` return value keeps
+// a valid `.location` instead of dangling against the freed one.
+fn processPopupNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) !void {
+    // Preserve popup identity fields. _name lives in the Page arena and
+    // survives Frame.deinit; _opener is just a pointer.
+
+    const reuse_window = frame.window;
+    const saved_name = reuse_window._name;
+    const saved_opener = reuse_window._opener;
+    const frame_id = frame._frame_id;
+    const page = self.currentPage().?;
+
+    frame.deinit();
+    frame.* = undefined;
+
+    errdefer {
+        // If re-init fails, drop from popups so we don't leave a corpse.
+        for (page.popups.items, 0..) |p, i| {
+            if (p == frame) {
+                _ = page.popups.swapRemove(i);
+                break;
+            }
+        }
+    }
+
+    try Frame.init(frame, frame_id, page, .{ .reuse_window = reuse_window });
+    errdefer frame.deinit();
+
+    frame.window._name = saved_name;
+    frame.window._opener = saved_opener;
+
+    frame.navigate(qn.url, qn.opts) catch |err| {
+        log.err(.browser, "queued popup navigation error", .{ .err = err });
+        return err;
+    };
+}
+
+fn processRootQueuedNavigation(self: *Session) !void {
+    const active = self._active orelse {
+        lp.assert(false, "Session.processRootQueuedNavigation - no active page", .{});
+    };
+    const current_frame = &active.frame;
+
+    // Detach the QueuedNavigation. Whether we keep it on the active frame
+    // (synthetic path) or transfer it to the pending frame (HTTP path), the
+    // current frame must no longer claim it.
+    const qn = current_frame._queued_navigation.?;
+    current_frame._queued_navigation = null;
+
+    // Synthetic navigations (about:blank, blob:) commit instantly — no HTTP,
+    // so there is no in-flight window to worry about. Use the optimized
+    // immediate-swap path for them.
+    const is_synthetic = qn.is_about_blank or std.mem.startsWith(u8, qn.url, "blob:");
+
+    // The qn arena is consumed here regardless of success — frame.navigate
+    // dupes the URL into the page's own arena, so we can release the qn
+    // arena as soon as navigate returns.
+    defer self.arena_pool.release(qn.arena);
+
+    if (is_synthetic) {
+        return self.replaceRootImmediate(current_frame._frame_id, qn.url, qn.opts);
+    }
+    return self.initiateRootNavigation(current_frame._frame_id, qn.url, qn.opts);
+}
+
+// Immediate-swap path for synthetic navigations (about:blank, blob:): there is
+// no in-flight HTTP and therefore no "pending" window to span — and no
+// frameHeaderDoneCallback to commit a pending Page. Tear down the active page
+// and create a new one in its place, then navigate it. Reached from both the
+// queued-navigation path (processRootQueuedNavigation) and the CDP entry point
+// (initiateRootNavigation); each caller owns any arena tied to `url`/`opts`.
+fn replaceRootImmediate(self: *Session, frame_id: u32, url: [:0]const u8, opts: Frame.NavigateOpts) !void {
+    self.tearDownActivePage();
+    const new_frame = try self.installNewActivePage(frame_id);
+
+    new_frame.navigate(url, opts) catch |err| {
+        log.err(.browser, "synthetic navigation error", .{ .err = err, .url = url });
+        return err;
+    };
+}
+
+// Real HTTP root navigation: allocate a pending Page, leave the active Page
+// alive, and dispatch the navigation HTTP request against the pending frame.
+// The active Page (and its V8 context) stays addressable across the round-
+// trip — Runtime.evaluate, DOM.*, etc. continue to operate on the OLD page
+// until commitPendingPage swaps the pointer when response headers arrive.
+pub fn initiateRootNavigation(self: *Session, frame_id: u32, url: [:0]const u8, opts: Frame.NavigateOpts) !void {
+    self.discardPendingPage();
+
+    // Synthetic navigations (about:blank, blob:) have no HTTP round-trip and
+    // therefore no frameHeaderDoneCallback to commit a pending Page. Swap the
+    // active Page immediately instead of allocating a pending one that would
+    // never be promoted, leaving the previous document in place (issue #2363).
+    if (std.mem.eql(u8, "about:blank", url) or std.mem.startsWith(u8, url, "blob:")) {
+        return self.replaceRootImmediate(frame_id, url, opts);
+    }
+
+    const page = try self.allocatePage(frame_id);
+    errdefer self.queuePageDestruction(page);
+
+    page._state = .pending;
+    self._pending = page;
+    errdefer self._pending = null;
+
+    if (comptime IS_DEBUG) {
+        log.debug(.browser, "initiate root navigation", .{ .url = url });
+    }
+
+    // No frame_created notification yet — CDP must not see the pending page
+    // (no isolated worlds, no Target.* visibility). Both the pending main
+    // world and the isolated worlds get registered with the V8 inspector at
+    // commit, after frame_remove tears down the OLD page's context group.
+
+    page.frame.navigate(url, opts) catch |err| {
+        log.err(.browser, "pending navigation start", .{ .err = err, .url = url });
+        return err;
+    };
+}
+
+// Promote the pending Page to be the active Page. Called from
+// frameHeaderDoneCallback when the in-flight pending root navigation's
+// response headers arrive.
+//
+// Order matters here:
+//   1. frame_remove dispatch — CDP's frameRemove resets the V8 inspector
+//      context group (emits Runtime.executionContextsCleared) and clears
+//      isolated world contexts plus the node_registry. The OLD page's
+//      memory is still alive at this point (intentional: CDP teardown can
+//      walk old-page state without UAF).
+//   2. Pointer flip and _state = .active. session.page now points at the
+//      pending page.
+//   3. frame_created dispatch — CDP creates fresh isolated world contexts
+//      against the new (now active) frame. While pending_page is still
+//      non-null at this point, CDP's frameCreated handler skips its
+//      frame_arena reset and captured_responses zeroing (the captured_
+//      response for the request we are committing was just inserted by
+//      onHttpResponseHeadersDone moments earlier and must survive).
+//   4. pending_page = null. Order matters: step 3 reads it.
+pub fn commitPendingPage(self: *Session) !void {
+    const pending = self._pending orelse {
+        lp.assert(false, "Session.commitPendingPage - no pending page", .{});
+    };
+    const old_active = self._active orelse {
+        lp.assert(false, "Session.commitPendingPage - no active page", .{});
+    };
+
+    if (comptime IS_DEBUG) {
+        log.debug(.browser, "commit pending page", .{});
+    }
+
+    // Step 1: clear the OLD page's CDP / V8 inspector state.
+    self.notification.dispatch(.frame_remove, .{});
+    self.navigation.onRemoveFrame();
+
+    // Step 2: pointer flip. Page addresses are stable (heap-allocated),
+    // so every self-pointer inside `pending` (window._frame,
+    // document._frame, EventManager.frame, etc.) remains valid.
+    self._active = pending;
+    pending._state = .active;
+
+    // Step 3: register the new page with CDP. `pending` is still set at
+    // this point — CDP's frameCreated handler reads `pendingPage() != null`
+    // to skip the captured_responses / frame_arena resets that would wipe
+    // the in-flight response we just received.
+    self.navigation.onNewFrame(&pending.frame) catch |err| {
+        log.err(.browser, "commitPendingPage onNewFrame", .{ .err = err });
+    };
+    self.notification.dispatch(.frame_created, &pending.frame);
+
+    // Step 4: `pending` = null AFTER frame_created so step 3 saw it.
+    self._pending = null;
+
+    // Step 5: tear down the OLD page LAST. Anything in steps 1-4 that
+    // needed to walk the OLD page's state (CDP node_registry, inspector
+    // context group, isolated worlds) has already done so. Kill any
+    // remaining transfers/websockets synchronously before queuing for
+    // deferred destroy — otherwise a still-inflight transfer firing its
+    // done_callback after this point would re-enter against the new
+    // _active and trip the half-torn-down session.
+    old_active.frame.abortTransfers();
+    self.queuePageDestruction(old_active);
+}
+
+// Discard a pending Page without committing. Used for failure paths
+// (HTTP error before commit, session deinit during pending, etc.). The
+// active page is untouched.
+pub fn discardPendingPage(self: *Session) void {
+    const page = self._pending orelse return;
+
+    if (comptime IS_DEBUG) {
+        log.debug(.browser, "discard pending page", .{});
+    }
+
+    // Force abort all inflight queries (HTTP + WS) before queuing for
+    // deferred destroy.
+    page.frame.abortTransfers();
+
+    self._pending = null;
+    self.queuePageDestruction(page);
+}
+
+// Frame IDs come from `Browser` (per-CDP-connection scope), not
+// `Session` (per-BrowserContext). Kept as a Session method so existing
+// callers (Frame, Worker) don't have to thread a Browser pointer.
+pub fn nextFrameId(self: *Session) u32 {
+    return self.browser.nextFrameId();
+}
+
+pub fn nextLoaderId(self: *Session) u32 {
+    const id = self.loader_id_gen +% 1;
+    self.loader_id_gen = id;
+    return id;
+}
