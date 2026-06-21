@@ -1,0 +1,30 @@
+services:
+  lightpanda:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lightpanda-minimal:latest
+    container_name: lightpanda-warm-pool
+    # Strict cgroup limitations
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 64M
+    # Use host networking if we want to expose 127.0.0.1:9222 to the host
+    # or just expose the port if we used 0.0.0.0.
+    # Given the requirement "exposes the internal CDP socket at 127.0.0.1:9222",
+    # using network_mode: host is a common way to achieve this on Linux.
+    network_mode: host
+    restart: always
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9222"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+      start_period: 1s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
